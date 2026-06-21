@@ -2,7 +2,7 @@
   "version": "1.0",
   "ai": {
     "provider": "openai",
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "api_key_env": "DEEPSEEK_API_KEY",
     "api_base": "https://api.deepseek.com/v1",
     "temperature": 0.3,
@@ -111,7 +111,7 @@
     }
   },
   "filtering": {
-    "ai_score_threshold": 3.0,
+    "ai_score_threshold": 1.0,
     "time_window_hours": 24,
     "max_items": null,
     "category_groups": {},
