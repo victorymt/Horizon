@@ -4,7 +4,7 @@
     "provider": "openai",
     "model": "deepseek-v4-flash",
     "api_key_env": "DEEPSEEK_API_KEY",
-    "api_base": "https://api.deepseek.com/v1",
+    "api_base": "https://api.deepseek.com",
     "temperature": 0.3,
     "max_tokens": 4096,
     "throttle_sec": 0,
