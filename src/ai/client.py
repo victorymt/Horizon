@@ -38,7 +38,9 @@ _DEFAULT_API_KEY_ENVS = {
 
 def _resolve_api_key(config: AIConfig, *, fallback: Optional[str] = None) -> str:
     api_key = os.getenv(config.api_key_env)
-    if api_key:
+    if api_key and api_key.strip():
+        if api_key != api_key.strip() or any(c.isspace() for c in api_key):
+            raise ValueError("API key contains whitespace; update the configured secret without spaces or newlines")
         return api_key
     if fallback is not None:
         return fallback
@@ -619,3 +621,54 @@ def create_ai_client(config: AIConfig) -> AIClient:
     if config.provider_chain:
         return _create_chained_client(config)
     return _create_single_client(config)
+
+
+class AIValidationError(RuntimeError):
+    """Safe diagnostic that never includes provider response bodies or secrets."""
+
+
+def is_authentication_error(exc: Exception) -> bool:
+    from tenacity import RetryError
+    if isinstance(exc, RetryError):
+        exc = exc.last_attempt.exception()
+    return (getattr(exc, "status_code", None) in (401, 403)
+            or type(exc).__name__ in {"AuthenticationError", "PermissionDeniedError"})
+
+
+async def validate_ai_startup(config: AIConfig) -> None:
+    """Validate configuration and make one small request through the real route."""
+    from urllib.parse import urlsplit
+    if "api_base" in (config.model_extra or {}):
+        raise AIValidationError("Unsupported ai.api_base; use ai.base_url")
+    if config.base_url:
+        url = urlsplit(config.base_url)
+        if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password or url.query or url.fragment:
+            raise AIValidationError("Invalid ai.base_url: use an HTTP(S) endpoint without credentials or query")
+    if not config.model.strip():
+        raise AIValidationError("AI model must not be empty")
+    if not config.provider_chain and config.provider != AIProvider.OLLAMA:
+        key = os.getenv(config.api_key_env)
+        if not key or not key.strip():
+            raise AIValidationError("AI key is missing or empty. Set the Actions secret referenced by ai.api_key_env.")
+        if any(c.isspace() for c in key):
+            raise AIValidationError("AI key contains whitespace. Replace the configured Actions secret without spaces or newlines.")
+    try:
+        client = create_ai_client(config)
+        response = await client.complete(
+            system='Return a JSON object.', user='Return {"ok": true}.', max_tokens=32,
+        )
+        if not response or not response.strip():
+            raise AIValidationError("AI startup validation returned an empty response")
+    except AIValidationError:
+        raise
+    except Exception as exc:
+        if is_authentication_error(exc):
+            raise AIValidationError(
+                "AI authentication rejected (HTTP 401/403). Check ai.base_url and the "
+                "GitHub Actions secret named by ai.api_key_env; replace it with a valid "
+                "key for that provider. No summary will be published."
+            ) from None
+        raise AIValidationError(
+            "AI startup validation failed (" + type(exc).__name__ +
+            "). Check key presence/whitespace, endpoint, model access, quota and connectivity."
+        ) from None

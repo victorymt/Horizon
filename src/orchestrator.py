@@ -22,7 +22,7 @@ from .scrapers.twitter import TwitterScraper
 from .scrapers.twitter_playwright import TwitterPlaywrightScraper
 from .scrapers.openbb import OpenBBScraper
 from .scrapers.ossinsight import OSSInsightScraper
-from .ai.client import create_ai_client
+from .ai.client import create_ai_client, validate_ai_startup
 from .ai.analyzer import ContentAnalyzer
 from .ai.summarizer import DailySummarizer
 from .ai.enricher import ContentEnricher
@@ -79,6 +79,8 @@ class HorizonOrchestrator:
             self.email_manager.check_subscriptions(self.storage)
 
         try:
+            await validate_ai_startup(self.config.ai)
+
             # 1. Determine time window
             since = self._determine_time_window(force_hours)
             self.console.print(f"📅 Fetching content since: {since.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -101,7 +103,7 @@ class HorizonOrchestrator:
 
             # 4. Analyze with AI
             analyzed_items = await self._analyze_content(merged_items)
-            self.console.print(f"🤖 Analyzed {len(analyzed_items)} items with AI\n")
+            self.console.print(f"🤖 AI analysis: {len(analyzed_items)} succeeded, {len(merged_items) - len(analyzed_items)} failed\n")
 
             # 5. Filter by score threshold
             threshold = self.config.filtering.ai_score_threshold
@@ -147,7 +149,10 @@ class HorizonOrchestrator:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             for lang in self.config.ai.languages:
                 summarizer = DailySummarizer()
-                summary = await summarizer.generate_summary(important_items, today, len(all_items), language=lang)
+                summary = await summarizer.generate_summary(important_items, today, len(analyzed_items), language=lang)
+                failed_count = len(merged_items) - len(analyzed_items)
+                if failed_count:
+                    summary += f"\n\n> Warning: AI analysis incomplete: {len(analyzed_items)} succeeded, {failed_count} failed. Failed items were excluded.\n"
 
                 # Save to data/summaries/
                 summary_path = self.storage.save_daily_summary(today, summary, language=lang)

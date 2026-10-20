@@ -178,6 +178,8 @@ def test_run_applies_balanced_digest_before_enrichment(tmp_path, monkeypatch) ->
     async def enrich_important_items(input_items):  # type: ignore[no-untyped-def]
         enriched_ids.extend(item.id for item in input_items)
 
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr("src.orchestrator.validate_ai_startup", AsyncMock())
     monkeypatch.setattr(orchestrator, "fetch_all_sources", fetch_all_sources)
     monkeypatch.setattr(orchestrator, "_analyze_content", analyze_content)
     monkeypatch.setattr(orchestrator, "merge_topic_duplicates", merge_topic_duplicates)
