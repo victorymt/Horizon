@@ -121,3 +121,27 @@ def test_legacy_endpoint_typo_rejected():
     cfg = AIConfig(**cfg.model_dump(), api_base="https://api.deepseek.com")
     with pytest.raises(AIValidationError, match="api_base"):
         asyncio.run(validate_ai_startup(cfg))
+
+
+def test_startup_probe_uses_configured_reasoning_budget(monkeypatch):
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
+    client = SimpleNamespace(complete=AsyncMock(return_value='{"ok":true}'))
+    monkeypatch.setattr('src.ai.client.create_ai_client', lambda cfg: client)
+    cfg = config().model_copy(update={"max_tokens": 4096})
+    asyncio.run(validate_ai_startup(cfg))
+    assert client.complete.call_args.kwargs['max_tokens'] == 4096
+
+
+@pytest.mark.parametrize('finish_reason', ['length', 'stop'])
+def test_empty_completion_diagnostic_does_not_expose_reasoning(monkeypatch, finish_reason):
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
+    client = OpenAIClient(config())
+    response = SimpleNamespace(usage=None, choices=[SimpleNamespace(
+        finish_reason=finish_reason,
+        message=SimpleNamespace(content='', reasoning_content='private-reasoning'),
+    )])
+    monkeypatch.setattr(client, '_do_request', AsyncMock(return_value=response))
+    with pytest.raises(AIValidationError) as error:
+        asyncio.run(client.complete('system', 'user'))
+    assert 'private-reasoning' not in str(error.value)
+    assert ('max_tokens' in str(error.value)) == (finish_reason == 'length')

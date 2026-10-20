@@ -33,3 +33,14 @@ real credentials, endpoint and model access; subsequent steps validate scraping,
 analysis and publishing. This sends real API requests and can incur normal usage
 costs. Do not rerun an old run to validate the fix: it uses the old commit.
 Historical published posts are not rewritten by this change.
+
+## Empty startup completion
+
+The first live run after the endpoint fix reached the completion API but returned
+empty final content. It did not raise an authentication error. The initial probe
+used only 32 output tokens, which can be consumed by reasoning before final
+content is emitted. The probe now uses `ai.max_tokens` (4096 in the GitHub config).
+Empty responses with `finish_reason=length` explicitly diagnose token exhaustion;
+other empty responses remain failures. No reasoning or response body is logged.
+The original run did not record finish_reason, so truncation is a likely cause,
+not a proven one. A new live run is required to confirm recovery.

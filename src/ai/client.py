@@ -261,7 +261,17 @@ class OpenAIClient(AIClient):
                 input_tokens=getattr(usage, "prompt_tokens", 0),
                 output_tokens=getattr(usage, "completion_tokens", 0),
             )
-        return response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
+        if not content or not content.strip():
+            # Only report a fixed diagnostic, never provider text or reasoning.
+            if getattr(choice, "finish_reason", None) == "length":
+                raise AIValidationError(
+                    "AI completion exhausted max_tokens before returning final content. "
+                    "Increase ai.max_tokens to allow reasoning and final output."
+                )
+            raise AIValidationError("AI completion returned empty final content (not an authentication error)")
+        return content
 
     async def _do_request(
         self,
@@ -655,7 +665,9 @@ async def validate_ai_startup(config: AIConfig) -> None:
     try:
         client = create_ai_client(config)
         response = await client.complete(
-            system='Return a JSON object.', user='Return {"ok": true}.', max_tokens=32,
+            system='Return a JSON object.', user='Return {"ok": true}.',
+            # Reasoning models share this budget between thinking and final output.
+            max_tokens=config.max_tokens,
         )
         if not response or not response.strip():
             raise AIValidationError("AI startup validation returned an empty response")
