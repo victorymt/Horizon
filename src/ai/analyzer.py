@@ -4,15 +4,19 @@ import asyncio
 import json
 import re
 from typing import List, Optional
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
 
-from .client import AIClient
+from .client import AIClient, is_authentication_error
 from .prompts import CONTENT_ANALYSIS_SYSTEM, CONTENT_ANALYSIS_USER
 from .utils import parse_json_response
 from ..models import ContentItem
 
 DEFAULT_THROTTLE_SEC = 0.0
+
+
+class AnalysisFailedError(RuntimeError):
+    """No item could be analyzed; publishing is unsafe."""
 
 
 class ContentAnalyzer:
@@ -45,14 +49,21 @@ class ContentAnalyzer:
         throttle_sec = self._get_throttle_sec()
         concurrency = self._get_concurrency()
         semaphore = asyncio.Semaphore(concurrency)
+        failures = []
+        auth_failed = False
 
         async def _process(item: ContentItem, index: int, progress_task) -> ContentItem:
+            nonlocal auth_failed
             async with semaphore:
                 try:
+                    if auth_failed:
+                        raise AnalysisFailedError("Skipped after authentication failure")
                     await self._analyze_item(item)
                 except Exception as e:
-                    print(f"Error analyzing item {item.id}: {e}")
-                    item.ai_score = 0.0
+                    auth_failed = auth_failed or is_authentication_error(e)
+                    failures.append(item.id)
+                    print(f"AI analysis failed ({type(e).__name__}); response body omitted")
+                    item.ai_score = None
                     item.ai_reason = "Analysis failed"
                     item.ai_summary = item.title
                 if throttle_sec > 0 and index < len(items) - 1:
@@ -73,11 +84,18 @@ class ContentAnalyzer:
             ]
             analyzed_items = await asyncio.gather(*coros)
 
-        return analyzed_items
+        if items and len(failures) == len(items):
+            reason = "authentication rejected; check endpoint and configured secret" if auth_failed else "all requests failed"
+            raise AnalysisFailedError(f"AI analysis failed for all {len(items)} items: {reason}. Publishing aborted.")
+        self.failed_count = len(failures)
+        failed_ids = set(failures)
+        return [item for item in analyzed_items if item.id not in failed_ids]
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(min=2, max=10)
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_exception(lambda exc: not is_authentication_error(exc)),
+        reraise=True
     )
     async def _analyze_item(self, item: ContentItem) -> None:
         """Analyze a single content item.
@@ -148,15 +166,14 @@ class ContentAnalyzer:
         # Parse JSON response with robust fallback
         result = self._parse_json_response(response)
         if result is None:
-            print(f"Warning: could not parse analysis response for {item.id}, using defaults")
-            item.ai_score = 0.0
-            item.ai_reason = "Analysis response parse failed"
-            item.ai_summary = item.title
-            item.ai_tags = []
-            return
+            raise ValueError("Invalid AI analysis JSON response")
 
         # Update item with analysis results
-        item.ai_score = float(result.get("score", 0))
+        import math
+        score = float(result["score"])
+        if not math.isfinite(score) or not 0 <= score <= 10:
+            raise ValueError("Invalid AI score")
+        item.ai_score = score
         item.ai_reason = result.get("reason", "")
         item.ai_summary = result.get("summary", item.title)
         item.ai_tags = result.get("tags", [])

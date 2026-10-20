@@ -29,6 +29,7 @@ jobs:
       - name: Prepare GitHub Actions config
         run: cp data/config.github.json data/config.json
 
+      # Startup validation runs before scraping; a nonzero exit blocks deployment.
       - name: Run Horizon
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

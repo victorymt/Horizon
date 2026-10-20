@@ -97,6 +97,8 @@ AI_PROVIDER_DEFAULTS = {
 class AIConfig(BaseModel):
     """AI client configuration."""
 
+    model_config = {"extra": "allow"}
+
     provider: AIProvider
     provider_chain: Optional[str] = None
     model: str
