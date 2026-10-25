@@ -2,12 +2,17 @@ name: Daily Horizon Summary
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs daily at 00:00 UTC
+    - cron: '17 0,8,16 * * *'  # Retry later if a scheduled run is dropped
   workflow_dispatch:      # Allow manual trigger
+
+concurrency:
+  group: horizon-daily-publication
+  cancel-in-progress: false
 
 jobs:
   daily-summary:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write  # Needed to commit changes
 
@@ -15,30 +20,64 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Check today's publication
+        id: publication
+        run: |
+          DATE=$(date -u +'%Y-%m-%d')
+          echo "DATE=$DATE" >> "$GITHUB_ENV"
+          echo "HORIZON_REPORT_DATE=$DATE" >> "$GITHUB_ENV"
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages --depth=1
+          if git cat-file -e "origin/gh-pages:_posts/$DATE-summary-en.md" && git cat-file -e "origin/gh-pages:_posts/$DATE-summary-zh.md"; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Python
+        if: steps.publication.outputs.needed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install uv
+        if: steps.publication.outputs.needed == 'true'
         uses: astral-sh/setup-uv@v3
 
       - name: Install dependencies
-        run: uv sync
+        if: steps.publication.outputs.needed == 'true'
+        run: uv sync --locked
 
       - name: Prepare GitHub Actions config
+        if: steps.publication.outputs.needed == 'true'
         run: cp data/config.github.json data/config.json
 
       # Startup validation runs before scraping; a nonzero exit blocks deployment.
       - name: Run Horizon
+        if: steps.publication.outputs.needed == 'true'
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: uv run horizon --hours 48
 
-      - name: Set current date as environment variable
-        run: echo "DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+      - name: Preserve raw input and generated summaries
+        if: always() && steps.publication.outputs.needed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-${{ env.DATE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            data/raw/*.json
+            data/summaries/*.md
+            docs/_posts/*.md
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Require both language outputs
+        if: steps.publication.outputs.needed == 'true'
+        run: |
+          test -s "docs/_posts/$DATE-summary-en.md"
+          test -s "docs/_posts/$DATE-summary-zh.md"
 
       - name: Deploy to GitHub Pages
+        if: steps.publication.outputs.needed == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}

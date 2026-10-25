@@ -145,3 +145,33 @@ def test_empty_completion_diagnostic_does_not_expose_reasoning(monkeypatch, fini
         asyncio.run(client.complete('system', 'user'))
     assert 'private-reasoning' not in str(error.value)
     assert ('max_tokens' in str(error.value)) == (finish_reason == 'length')
+
+
+def test_live_fetch_rejects_historical_date(monkeypatch, tmp_path):
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('HORIZON_REPORT_DATE', '2000-01-01')
+    fetch = AsyncMock()
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    monkeypatch.setattr(orchestrator, 'fetch_all_sources', fetch)
+    with pytest.raises(ValueError, match='historical'):
+        asyncio.run(orchestrator.run())
+    fetch.assert_not_called()
+
+
+def test_raw_input_survives_analysis_failure(monkeypatch, tmp_path):
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator
+    monkeypatch.chdir(tmp_path)
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    monkeypatch.setattr('src.orchestrator.validate_ai_startup', AsyncMock())
+    monkeypatch.setattr(orchestrator, 'fetch_all_sources', AsyncMock(return_value=[_make_item('1')]))
+    monkeypatch.setattr(orchestrator, '_analyze_content', AsyncMock(side_effect=AnalysisFailedError('failed')))
+    with pytest.raises(AnalysisFailedError):
+        asyncio.run(orchestrator.run())
+    archive, = (tmp_path / 'data/raw').glob('*.json')
+    payload = json.loads(archive.read_text())
+    assert payload['items'][0]['id'] == '1'
+    assert payload['since'] < payload['fetched_at']
+    assert not (tmp_path / 'docs').exists()

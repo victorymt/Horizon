@@ -1,6 +1,9 @@
 """Main orchestrator coordinating the entire workflow."""
 
 import asyncio
+import json
+import os
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -78,6 +81,11 @@ class HorizonOrchestrator:
             self.console.print("📧 Checking for new email subscriptions...")
             self.email_manager.check_subscriptions(self.storage)
 
+        started_at = datetime.now(timezone.utc)
+        report_date = os.environ.get("HORIZON_REPORT_DATE", started_at.strftime("%Y-%m-%d"))
+        if report_date != started_at.strftime("%Y-%m-%d"):
+            raise ValueError("Live fetching cannot backfill a historical report date")
+
         try:
             await validate_ai_startup(self.config.ai)
 
@@ -88,6 +96,20 @@ class HorizonOrchestrator:
             # 2. Fetch content from all sources
             all_items = await self.fetch_all_sources(since)
             self.console.print(f"📥 Fetched {len(all_items)} items from all sources\n")
+
+            archive_dir = Path("data/raw")
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive = {
+                "schema_version": 1,
+                "report_date": report_date,
+                "started_at": started_at.isoformat(),
+                "since": since.isoformat(),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "items": [item.model_dump(mode="json") for item in all_items],
+            }
+            (archive_dir / f"{report_date}.json").write_text(
+                json.dumps(archive, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
             if not all_items:
                 self.console.print("[yellow]No new content found. Exiting.[/yellow]")
@@ -146,7 +168,7 @@ class HorizonOrchestrator:
             await self._enrich_important_items(important_items)
 
             # 7. Generate and save daily summaries for each configured language
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today = report_date
             for lang in self.config.ai.languages:
                 summarizer = DailySummarizer()
                 summary = await summarizer.generate_summary(important_items, today, len(analyzed_items), language=lang)
@@ -160,8 +182,6 @@ class HorizonOrchestrator:
 
                 # Copy to docs/ for GitHub Pages
                 try:
-                    from pathlib import Path
-
                     post_filename = f"{today}-summary-{lang}.md"
                     posts_dir = Path("docs/_posts")
                     posts_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +211,7 @@ class HorizonOrchestrator:
 
                     self.console.print(f"📄 Copied {lang.upper()} summary to GitHub Pages: {dest_path}\n")
                 except Exception as e:
-                    self.console.print(f"[yellow]⚠️  Failed to copy {lang.upper()} summary to docs/: {e}[/yellow]\n")
+                    raise RuntimeError(f"Failed to write {lang} Pages summary") from e
 
                 # Send email if configured
                 if self.email_manager and self.config.email and self.config.email.enabled:
