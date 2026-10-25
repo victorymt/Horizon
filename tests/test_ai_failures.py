@@ -175,3 +175,70 @@ def test_raw_input_survives_analysis_failure(monkeypatch, tmp_path):
     assert payload['items'][0]['id'] == '1'
     assert payload['since'] < payload['fetched_at']
     assert not (tmp_path / 'docs').exists()
+
+
+def test_report_date_accepts_next_utc_day_for_utc_plus_8(monkeypatch, tmp_path):
+    """A 16:17 UTC run is 00:17 (+08) the next day; that must not be rejected."""
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator, REPORT_TIMEZONE
+    from datetime import datetime, timezone, timedelta
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('src.orchestrator.validate_ai_startup', AsyncMock())
+    tomorrow = (datetime.now(timezone.utc).astimezone(REPORT_TIMEZONE) + timedelta(days=1)).strftime('%Y-%m-%d')
+    monkeypatch.setenv('HORIZON_REPORT_DATE', tomorrow)
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    monkeypatch.setattr(orchestrator, 'fetch_all_sources', AsyncMock(return_value=[]))
+    # Accepted -> proceeds to fetching instead of raising.
+    asyncio.run(orchestrator.run())
+    orchestrator.fetch_all_sources.assert_awaited()
+
+
+def test_calendar_day_window_is_utc_plus_8_midnight_to_midnight(monkeypatch):
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator
+    from datetime import datetime, timezone
+
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    since, until = orchestrator._determine_time_window(None, '2026-10-26')
+    assert until == datetime(2026, 10, 25, 16, 0, tzinfo=timezone.utc)
+    assert since == datetime(2026, 10, 24, 16, 0, tzinfo=timezone.utc)
+
+
+def test_rolling_lookback_has_no_upper_bound(monkeypatch):
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator
+    from datetime import datetime, timezone
+
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    since, until = orchestrator._determine_time_window(48, None)
+    assert until is None
+    assert since < datetime.now(timezone.utc)
+
+
+def test_items_after_report_window_are_dropped(monkeypatch, tmp_path):
+    """A delayed run must not leak next-day items into the filed digest."""
+    from src.models import Config
+    from src.orchestrator import HorizonOrchestrator
+    from test_analyzer import _make_item
+    from datetime import datetime, timezone, timedelta
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('src.orchestrator.validate_ai_startup', AsyncMock())
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
+    monkeypatch.setenv('HORIZON_REPORT_DATE', tomorrow)
+
+    inside = _make_item('inside')
+    inside.published_at = datetime(2026, 10, 25, 8, 0, tzinfo=timezone.utc)
+    outside = _make_item('outside')
+    outside.published_at = datetime(2026, 10, 25, 20, 0, tzinfo=timezone.utc)
+
+    orchestrator = HorizonOrchestrator(Config(ai=config(), sources={}, filtering={}), Mock())
+    monkeypatch.setattr(orchestrator, 'fetch_all_sources', AsyncMock(return_value=[inside, outside]))
+    monkeypatch.setattr(orchestrator, '_analyze_content', AsyncMock(side_effect=AnalysisFailedError('failed')))
+    with pytest.raises(AnalysisFailedError):
+        asyncio.run(orchestrator.run())
+
+    archive, = (tmp_path / 'data/raw').glob('*.json')
+    ids = [item['id'] for item in json.loads(archive.read_text())['items']]
+    assert ids == ['inside']

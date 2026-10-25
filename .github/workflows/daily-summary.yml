@@ -2,7 +2,10 @@ name: Daily Horizon Summary
 
 on:
   schedule:
-    - cron: '17 0,8,16 * * *'  # Retry later if a scheduled run is dropped
+    # 16:17 UTC is 00:17 the next day in UTC+8. Two retries follow within the
+    # same UTC+8 calendar day (20:17 UTC = 04:17, 00:17 UTC = 08:17) so a
+    # dropped run still publishes the same report date.
+    - cron: '17 16,20,0 * * *'
   workflow_dispatch:      # Allow manual trigger
 
 concurrency:
@@ -23,7 +26,9 @@ jobs:
       - name: Check today's publication
         id: publication
         run: |
-          DATE=$(date -u +'%Y-%m-%d')
+          # Report date is the UTC+8 calendar day, not the UTC day: the 16:17 UTC
+          # trigger is 00:17 (+08) of the following date.
+          DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
           echo "DATE=$DATE" >> "$GITHUB_ENV"
           echo "HORIZON_REPORT_DATE=$DATE" >> "$GITHUB_ENV"
           git fetch origin gh-pages:refs/remotes/origin/gh-pages --depth=1
@@ -52,11 +57,14 @@ jobs:
         run: cp data/config.github.json data/config.json
 
       # Startup validation runs before scraping; a nonzero exit blocks deployment.
+      # No --hours here on purpose: a rolling lookback would ignore the report
+      # date. Without it the window is the UTC+8 calendar day derived from
+      # HORIZON_REPORT_DATE above.
       - name: Run Horizon
         if: steps.publication.outputs.needed == 'true'
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: uv run horizon --hours 48
+        run: uv run horizon
 
       - name: Preserve raw input and generated summaries
         if: always() && steps.publication.outputs.needed == 'true'

@@ -31,6 +31,18 @@ from .ai.summarizer import DailySummarizer
 from .ai.enricher import ContentEnricher
 from .ai.tokens import get_usage_snapshot
 
+# Reports are filed by this calendar day, not by UTC. A run scheduled at
+# 16:17 UTC is 00:17 on the next day here.
+REPORT_TIMEZONE = timezone(timedelta(hours=8), "UTC+08:00")
+REPORT_TIMEZONE_LABEL = "UTC+08:00 calendar day"
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize an item timestamp to an aware UTC datetime."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 
 @dataclass
 class BalancedDigestResult:
@@ -82,19 +94,51 @@ class HorizonOrchestrator:
             self.email_manager.check_subscriptions(self.storage)
 
         started_at = datetime.now(timezone.utc)
-        report_date = os.environ.get("HORIZON_REPORT_DATE", started_at.strftime("%Y-%m-%d"))
-        if report_date != started_at.strftime("%Y-%m-%d"):
+        # Only an explicitly supplied report date switches the run to calendar-day
+        # anchoring. Without it (local CLI runs) the rolling lookback is kept, so
+        # `uv run horizon` still reports on recent news rather than yesterday.
+        explicit_report_date = os.environ.get("HORIZON_REPORT_DATE")
+        report_date = explicit_report_date or started_at.strftime("%Y-%m-%d")
+        # The report date is anchored to REPORT_TIMEZONE (UTC+8), so a run that
+        # happens late in the UTC day legitimately reports the next calendar day.
+        # Accept only the current UTC date or the one after it; anything else is
+        # an attempt to backfill history from live sources and must fail.
+        utc_today = started_at.strftime("%Y-%m-%d")
+        utc_tomorrow = (started_at + timedelta(days=1)).strftime("%Y-%m-%d")
+        if report_date not in (utc_today, utc_tomorrow):
             raise ValueError("Live fetching cannot backfill a historical report date")
 
         try:
             await validate_ai_startup(self.config.ai)
 
             # 1. Determine time window
-            since = self._determine_time_window(force_hours)
-            self.console.print(f"📅 Fetching content since: {since.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            since, until = self._determine_time_window(
+                force_hours, report_date if explicit_report_date else None
+            )
+            if until is None:
+                self.console.print(
+                    f"📅 Fetching content since: {since.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                )
+            else:
+                self.console.print(
+                    f"📅 Report {report_date} covers "
+                    f"{since.isoformat()} → {until.isoformat()} "
+                    f"({REPORT_TIMEZONE_LABEL})\n"
+                )
 
             # 2. Fetch content from all sources
             all_items = await self.fetch_all_sources(since)
+            if until is not None:
+                # A delayed run can pull items published after the report day
+                # ended; drop them so the digest matches the date it is filed as.
+                before = len(all_items)
+                all_items = [
+                    item for item in all_items if _as_utc(item.published_at) < until
+                ]
+                if len(all_items) != before:
+                    self.console.print(
+                        f"✂️  Dropped {before - len(all_items)} items published after the report window\n"
+                    )
             self.console.print(f"📥 Fetched {len(all_items)} items from all sources\n")
 
             archive_dir = Path("data/raw")
@@ -259,13 +303,32 @@ class HorizonOrchestrator:
 
             raise
 
-    def _determine_time_window(self, force_hours: int = None) -> datetime:
+    def _determine_time_window(
+        self, force_hours: int = None, report_date: str = None
+    ) -> tuple[datetime, datetime | None]:
+        """Resolve the fetch window for this run.
+
+        Returns:
+            (since, until) in UTC. `until` is None when the caller asked for a
+            plain rolling lookback (--hours or time_window_hours), which has no
+            upper bound. When a report date is supplied the window is the
+            calendar day that ended at that date's start in REPORT_TIMEZONE, and
+            `until` is enforced so a delayed run cannot leak later items in.
+        """
         if force_hours:
             since = datetime.now(timezone.utc) - timedelta(hours=force_hours)
-        else:
-            hours = self.config.filtering.time_window_hours
-            since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        return since
+            return since, None
+
+        if report_date:
+            day_start = datetime.strptime(report_date, "%Y-%m-%d").replace(
+                tzinfo=REPORT_TIMEZONE
+            )
+            until = day_start.astimezone(timezone.utc)
+            return until - timedelta(days=1), until
+
+        hours = self.config.filtering.time_window_hours
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        return since, None
 
     async def fetch_all_sources(self, since: datetime) -> List[ContentItem]:
         """Fetch content from all configured sources.
